@@ -1,5 +1,5 @@
 use maki_providers::provider::Provider;
-use maki_providers::retry::{MAX_TIMEOUT_RETRIES, RetryState};
+use maki_providers::retry::{MAX_RETRIES, RetryState};
 use maki_providers::{Message, Model, ProviderEvent, StreamResponse, ThinkingConfig};
 use serde_json::Value;
 use tracing::warn;
@@ -59,7 +59,8 @@ pub(crate) async fn stream_with_retry(
                     warn!("rotated API key after error: {e}");
                 }
                 let (attempt, delay) = retry.next_delay();
-                if matches!(e, AgentError::Timeout { .. }) && attempt > MAX_TIMEOUT_RETRIES {
+                if attempt > MAX_RETRIES {
+                    warn!(attempt, error = %e, "giving up after max retries");
                     return Err(e);
                 }
                 let delay_ms = delay.as_millis() as u64;

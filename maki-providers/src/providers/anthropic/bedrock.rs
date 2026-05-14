@@ -1,7 +1,7 @@
 use std::env;
 use std::ops::ControlFlow;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use flume::Sender;
@@ -22,6 +22,33 @@ const BEDROCK_API_VERSION: &str = "bedrock-2023-05-31";
 const MIN_EVENTSTREAM_FRAME: usize = 16;
 const CONTAINER_METADATA_TIMEOUT: Duration = Duration::from_secs(5);
 const REFRESH_MARGIN: Duration = Duration::from_secs(5 * 60);
+
+// TCP keepalive detects idle pooled connections that AWS/LBs/NAT have silently
+// dropped before the next request reuses them; without this, send_async
+// surfaces an opaque CURLE_OPERATION_TIMEDOUT minutes later.
+const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+// curl's low_speed_timeout floor: fires when throughput drops below this for
+// `low_speed` seconds. Bytes/sec rather than wall-clock is the right detector
+// during slow uploads of multi-MB bodies.
+const LOW_SPEED_BYTES_PER_SEC: u32 = 1;
+// One per likely concurrent subagent + slack, with TCP keepalive for dead
+// connection detection on reuse.
+const CONNECTION_CACHE_SIZE: usize = 8;
+// Wall-clock backstop multiplier for one full attempt (send + first byte).
+// Mirrors AWS SDK's `operation_attempt_timeout`: long enough to never fire on
+// healthy traffic, short enough to unwedge a stuck attempt.
+const SEND_DEADLINE_MULTIPLIER: u32 = 2;
+const SEND_DEADLINE_FLOOR: Duration = Duration::from_secs(600);
+
+fn build_client(timeouts: super::super::Timeouts) -> HttpClient {
+    HttpClient::builder()
+        .connect_timeout(timeouts.connect)
+        .low_speed_timeout(LOW_SPEED_BYTES_PER_SEC, timeouts.low_speed)
+        .tcp_keepalive(TCP_KEEPALIVE_INTERVAL)
+        .connection_cache_size(CONNECTION_CACHE_SIZE)
+        .build()
+        .expect("failed to build Bedrock HTTP client")
+}
 
 fn io_error(
     kind: std::io::ErrorKind,
@@ -478,6 +505,8 @@ pub(crate) struct Bedrock {
     client: HttpClient,
     auth: Arc<Mutex<BedrockAuth>>,
     base_url: Option<String>,
+    stream_timeout: Duration,
+    low_speed_timeout: Duration,
 }
 
 impl Bedrock {
@@ -490,9 +519,11 @@ impl Bedrock {
         })?;
         let base_url = env::var("ANTHROPIC_BEDROCK_BASE_URL").ok();
         Ok(Self {
-            client: super::super::http_client(timeouts),
+            client: build_client(timeouts),
             auth: Arc::new(Mutex::new(auth)),
             base_url,
+            stream_timeout: timeouts.stream,
+            low_speed_timeout: timeouts.low_speed,
         })
     }
 
@@ -523,7 +554,7 @@ impl Provider for Bedrock {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         thinking: ThinkingConfig,
-        _session_id: Option<&'a str>,
+        session_id: Option<&'a str>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             if self.needs_refresh() {
@@ -561,7 +592,10 @@ impl Provider for Bedrock {
                 ),
             };
 
-            let json_body = serde_json::to_vec(&body)?;
+            // Offload JSON serialization onto smol's blocking pool so a
+            // multi-MB body doesn't stall sibling subagent futures sharing
+            // this executor (see RC3 / aws-sdk-rust#1400).
+            let json_body = smol::unblock(move || serde_json::to_vec(&body)).await?;
 
             let (host, _, _) = parse_url(&url);
             let host = host.to_string();
@@ -574,18 +608,39 @@ impl Provider for Bedrock {
                     secret_key,
                     session_token,
                     expires_at: _,
-                } => Some(sign_request_sigv4(
-                    "POST",
-                    &url,
-                    &extra_headers,
-                    &json_body,
-                    access_key,
-                    secret_key,
-                    session_token.as_deref(),
-                    &auth.region,
-                    "bedrock",
-                    &timestamp,
-                )),
+                } => {
+                    // SigV4 dominated by hex_sha256 over the body, ~10-50ms
+                    // CPU on multi-MB. Offload to keep the executor cooperative.
+                    let url_owned = url.clone();
+                    let body_owned = json_body.clone();
+                    let access = access_key.clone();
+                    let secret = secret_key.clone();
+                    let token = session_token.clone();
+                    let region = auth.region.clone();
+                    let ts = timestamp.clone();
+                    let host_hdr = host.clone();
+                    Some(
+                        smol::unblock(move || {
+                            let extra = vec![
+                                ("content-type", "application/json"),
+                                ("host", host_hdr.as_str()),
+                            ];
+                            sign_request_sigv4(
+                                "POST",
+                                &url_owned,
+                                &extra,
+                                &body_owned,
+                                &access,
+                                &secret,
+                                token.as_deref(),
+                                &region,
+                                "bedrock",
+                                &ts,
+                            )
+                        })
+                        .await,
+                    )
+                }
                 AuthKind::Bearer { token } => {
                     Some(vec![("Authorization".into(), format!("Bearer {token}"))])
                 }
@@ -605,7 +660,29 @@ impl Provider for Bedrock {
 
             debug!(model = %model_id, region = %auth.region, "sending Bedrock request");
 
-            let mut response = self.client.send_async(request).await?;
+            let stream_timeout = self.stream_timeout;
+            let read_timeout = self.low_speed_timeout;
+            let send_deadline =
+                std::cmp::max(stream_timeout * SEND_DEADLINE_MULTIPLIER, SEND_DEADLINE_FLOOR);
+            let is_subagent = session_id.is_some();
+            let send_started = Instant::now();
+            let mut response = futures_lite::future::or(
+                async { self.client.send_async(request).await.map_err(AgentError::from) },
+                async {
+                    smol::Timer::after(send_deadline).await;
+                    let elapsed_ms = send_started.elapsed().as_millis();
+                    warn!(
+                        phase = "send",
+                        duration_ms = elapsed_ms as u64,
+                        is_subagent,
+                        "Bedrock request exceeded send deadline"
+                    );
+                    Err(AgentError::Timeout {
+                        secs: send_deadline.as_secs(),
+                    })
+                },
+            )
+            .await?;
             let status = response.status().as_u16();
             if status != 200 {
                 return Err(AgentError::from_response(response).await);
@@ -614,16 +691,41 @@ impl Provider for Bedrock {
             let mut parser = shared::EventParser::new();
             let mut frame_buf = Vec::new();
             let mut read_buf = [0u8; 8192];
+            let mut deadline = Instant::now() + read_timeout;
+            let mut bytes_read_total: u64 = 0;
+            let mut first_byte = true;
 
             loop {
                 let body = response.body_mut();
+                let read_started = Instant::now();
                 let n = {
                     use futures_lite::io::AsyncReadExt;
-                    body.read(&mut read_buf).await?
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    futures_lite::future::or(
+                        async { body.read(&mut read_buf).await.map_err(AgentError::from) },
+                        async {
+                            smol::Timer::after(remaining).await;
+                            let phase = if first_byte { "first_byte" } else { "read" };
+                            warn!(
+                                phase,
+                                duration_ms = read_started.elapsed().as_millis() as u64,
+                                bytes_read_total,
+                                is_subagent,
+                                "Bedrock stream stalled"
+                            );
+                            Err(AgentError::Timeout {
+                                secs: read_timeout.as_secs(),
+                            })
+                        },
+                    )
+                    .await?
                 };
                 if n == 0 {
                     break;
                 }
+                first_byte = false;
+                bytes_read_total += n as u64;
+                deadline = Instant::now() + read_timeout;
                 frame_buf.extend_from_slice(&read_buf[..n]);
 
                 while frame_buf.len() >= MIN_EVENTSTREAM_FRAME {

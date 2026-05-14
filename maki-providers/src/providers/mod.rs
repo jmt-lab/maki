@@ -36,7 +36,7 @@ impl Default for Timeouts {
         Self {
             connect: Duration::from_secs(10),
             stream: Duration::from_secs(300),
-            low_speed: Duration::from_secs(30),
+            low_speed: Duration::from_secs(120),
         }
     }
 }
